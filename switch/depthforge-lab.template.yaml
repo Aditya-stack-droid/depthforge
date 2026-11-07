@@ -29,7 +29,7 @@ params:
   team:
     type: string
     label: Hackathon team ID
-    default: "T01"
+    default: "TigerFC"
 
 agents:
   - name: "forge-lead"

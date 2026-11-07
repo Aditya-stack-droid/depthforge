@@ -21,7 +21,7 @@ python -m depthforge.cli analyze --scale 4 --condition hard
 python -m depthforge.cli run --method hybrid --scale 8 --condition noisy --on snap --png /tmp/x.png
 python -m depthforge.cli compare --scale 4 --condition holes --seed 3
 python -m depthforge.cli ablate --n 10 --scale 4 --condition hard
-python scripts/evaluate.py --data nyu --mat nyu_depth_v2_labeled.mat --n 100 --team T01  # or --data synth
+python scripts/evaluate.py --data nyu --mat nyu_depth_v2_labeled.mat --n 100 --team TigerFC  # or --data synth
 ```
 Methods: `nearest bilinear bicubic classical dl hybrid`.
 Stages: `denoise hole_fill jbu guided cnn fusion` (on by default; disable with `--off`) and
