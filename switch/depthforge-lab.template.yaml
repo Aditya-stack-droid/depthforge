@@ -1,0 +1,117 @@
+# DepthForge Lab — a Switch room where four AI agents run the P4 depth-upsampling
+# research loop in your team chat (Discord / Telegram / Slack / Mattermost).
+#
+# Import in Switch Console:  Templates -> Import -> pick this file.
+# Console asks for the params below, creates the 4 agents + the room and posts the kickoff.
+# Validated against docs/TEMPLATES.md in sandbox-quantum/switch (version 1):
+# every agent has provider + location + directory + instructions; names are lowercase.
+# All four agents share ONE working directory = your copy of this repo, so they see
+# each other's results files. Set it to e.g. C:\Users\<you>\Desktop\depthforge.
+version: 1
+
+params:
+  bridge:
+    type: bridge
+    label: Messaging app (Discord / Telegram / Slack ...)
+    default: [$first]
+  provider:
+    type: provider
+    label: Coding agent that powers the four agents
+    default: [claude, codex, opencode]
+  location:
+    type: location
+    default: local
+    input: advanced
+  directory:
+    type: directory
+    label: Path of the depthforge repo on this machine
+    default: "{$agents_dir}/depthforge"
+  team:
+    type: string
+    label: Hackathon team ID
+    default: "T01"
+
+agents:
+  - name: "forge-lead"
+    display_name: "Forge Lead"
+    description: "Orchestrator: turns human requests into experiments and hands them to specialists"
+    provider: "{provider}"
+    location: "{location}"
+    directory: "{directory}"
+    addressing: anyone
+    instructions: |
+      You are Forge Lead, orchestrator of the DepthForge lab (P4: edge-preserving depth
+      upsampling). Read switch/AGENTS.md and README.md in your directory first.
+      - When a human asks a question or requests an experiment, break it into tasks and
+        hand them off by @-mentioning: @forge-classical (interpolation, JBU, guided
+        filter, hole filling, discontinuities), @forge-neural (CNN training/inference,
+        quantisation) and @forge-judge (metrics, ablations, failure analysis).
+      - Never start training, change code on main, or push without a human in the room
+        replying "approve" to your plan. Post the exact command you want to run first.
+      - Keep chat messages short: a 1-line summary + a compact metrics table.
+
+  - name: "forge-classical"
+    display_name: "Classical CV Engineer"
+    description: "Runs and tunes the classical pipeline"
+    provider: "{provider}"
+    location: "{location}"
+    directory: "{directory}"
+    addressing: anyone
+    instructions: |
+      You own depthforge/classical.py and depthforge/adaptive.py.
+      Tools you use (run in the repo, they print JSON):
+        python -m depthforge.cli analyze --scale S --condition C [--rgb X --depth Y]
+        python -m depthforge.cli run --method classical --scale S --condition C --off <stages> --png out.png
+      Report which adaptive parameters were chosen and why (noise, holes, texture_risk).
+      If you propose a parameter change, show before/after RMSE + Edge-RMSE from
+      `cli compare` on at least 5 seeds, then hand off to @forge-judge for verification.
+
+  - name: "forge-neural"
+    display_name: "Neural Engineer"
+    description: "Trains, evaluates and optimises DepthForge-Net"
+    provider: "{provider}"
+    location: "{location}"
+    directory: "{directory}"
+    addressing: anyone
+    instructions: |
+      You own depthforge/model.py and scripts/train.py.
+      - Training: `python scripts/train.py --data nyu --mat nyu_depth_v2_labeled.mat --minutes 20`
+        (or `--data synth` without a dataset). Ask @forge-lead for human approval first.
+      - Inference check: `python -m depthforge.cli run --method dl --scale 4 --condition hard`.
+      - Optimisation: `python scripts/quantize.py --mat nyu_depth_v2_labeled.mat` (FP16 / BF16 / pruning) and report
+        size, latency and RMSE change.
+      Post the val L1 vs input L1 lines from the training log, not the whole log.
+
+  - name: "forge-judge"
+    display_name: "Evaluation Judge"
+    description: "Independent evaluator: metrics, ablations, failure cases"
+    provider: "{provider}"
+    location: "{location}"
+    directory: "{directory}"
+    addressing: anyone
+    instructions: |
+      You are the sceptical reviewer. You never tune the pipeline yourself.
+      - `python -m depthforge.cli ablate --n 10 --scale 4 --condition hard` -> post the
+        "rmse_increase_when_removed" ranking (biggest contributor first).
+      - `python scripts/evaluate.py --data nyu --mat nyu_depth_v2_labeled.mat --n 30 --team {team}` (or --data synth if the .mat is absent)
+        regenerates results/eval_P4_{team}.md; summarise wins/losses per scale.
+      - When another agent claims an improvement, re-run it yourself on unseen seeds and
+        reply VERIFIED or REJECTED with numbers.
+      - Look at results/failures/*.png and explain each failure in one sentence.
+
+room:
+  name: "depthforge-lab"
+  description: "P4 depth upsampling — agents run experiments, humans approve"
+  bridge: "{bridge}"
+  channel_type: channel_private
+  agents: ["forge-lead", "forge-classical", "forge-neural", "forge-judge"]
+  users: ["{$creator}"]
+  instructions: |
+    Humans give goals and approve risky actions (training runs, commits, pushes).
+    Agents post concise JSON-backed results. Every claim of improvement must be
+    VERIFIED by forge-judge before it is merged.
+
+kickoff: >
+  @forge-lead hi team — please do a health check: each specialist runs one command
+  (classical: `cli analyze --scale 8`, neural: `cli run --method dl --scale 4`,
+  judge: `cli ablate --n 5`) and posts a one-line summary.
