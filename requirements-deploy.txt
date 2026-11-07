@@ -1,0 +1,8 @@
+# Lightweight runtime for the web app (no PyTorch): fits free 512 MB hosting tiers.
+# Training / evaluation / ONNX export use requirements.txt instead.
+numpy>=1.26
+opencv-python-headless>=4.9
+scikit-image>=0.22
+scipy>=1.11
+gradio>=4.44
+onnxruntime>=1.17

@@ -1,0 +1,9 @@
+numpy>=1.26
+opencv-python-headless>=4.9
+scikit-image>=0.22
+scipy>=1.11
+gradio>=4.44
+h5py>=3.10
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+onnxruntime>=1.17

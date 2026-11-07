@@ -1,0 +1,9 @@
+.git
+__pycache__
+*.mat
+data/
+results/failures/
+.switch/
+*.ipynb_checkpoints
+weights/depthforge_net_synth.pt
+notebooks/

@@ -1,0 +1,10 @@
+.git
+.github
+__pycache__/
+*.pyc
+*.mat
+data/
+.switch/
+notebooks/
+weights/depthforge_net_synth.pt
+results/failures/

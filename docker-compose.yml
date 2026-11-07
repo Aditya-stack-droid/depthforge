@@ -1,0 +1,8 @@
+services:
+  depthforge:
+    build: .
+    ports: ["7860:7860"]
+    environment:
+      # BF16 is only fast on CPUs with native bfloat16 (AVX512-BF16 / AMX); off for laptops
+      - DEPTHFORGE_BF16=0
+    restart: unless-stopped
