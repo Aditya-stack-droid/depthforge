@@ -10,7 +10,11 @@ pinned: false
 
 # DepthForge: edge-preserving depth map upsampling (P4)
 
-**Live demo:** `<paste your Cloud Run URL>` · **Code:** `<paste GitHub URL>` · **Team:** `<T01>` · **Problem:** P4
+**Live demo:** https://depthforge-731810864279.us-central1.run.app · **Code:** https://github.com/Aditya-stack-droid/depthforge · **Problem:** P4
+
+**Team Tiger FC (TigerFC):** Aditya Hubbly (1RUA24CSE0021) · Samay Chetan (1RUA24CSE0401) · Shaun (1RUA24CSE0427) · Farhan (1RUA24CSE0490)
+
+> Live demo runs on Google Cloud Run (2 vCPU, scales to zero). The first visit after idle takes ~10–20 s to wake; a hybrid run then takes ~3–10 s. Works on phones too.
 
 Deploy guide: [`docs/DEPLOY.md`](docs/DEPLOY.md) · Demo script & viva notes: [`docs/VIVA_PREP.md`](docs/VIVA_PREP.md)
 
@@ -48,7 +52,7 @@ Trained on NYU train (900) and tuned on NYU val (100). The test images were neve
   On clean input the strategy correctly reduces to the CNN alone.
 * BF16 inference is 2.5× faster on CPUs with native bfloat16 support for +0.4 % RMSE (`results/optimization.md`).
 * Full tables (MAE, PSNR, SSIM, Edge-RMSE, Boundary-F1, latency, memory), the ablation and failure
-  cases: `results/eval_P4_T01.md`, `docs/FAILURE_ANALYSIS.md`.
+  cases: `results/eval_P4_TigerFC.md`, `docs/FAILURE_ANALYSIS.md`.
 
 ## Quick start
 
@@ -68,7 +72,7 @@ Three NYU test scenes and three synthetic scenes are bundled (`samples/`), so th
 # train on NYU Depth V2 (GPU ~20 min; see notebooks/train_nyu_colab.ipynb)
 python scripts/train.py --data nyu --mat nyu_depth_v2_labeled.mat --minutes 60 --crop 128 --batch 32 --init weights/depthforge_net.pt
 # submission evaluation on the unseen NYU test split (images 1000-1448)
-python scripts/evaluate.py --data nyu --mat nyu_depth_v2_labeled.mat --n 449 --team T01 --usns "USN1,USN2,USN3,USN4"
+python scripts/evaluate.py --data nyu --mat nyu_depth_v2_labeled.mat --n 449 --team TigerFC --usns "USN1,USN2,USN3,USN4"
 # model optimisation study (FP16 / BF16 / pruning)
 python scripts/quantize.py
 # no dataset? everything also runs on procedural synthetic RGB-D scenes
@@ -76,7 +80,7 @@ python scripts/train.py --data synth --minutes 10 && python scripts/evaluate.py 
 pytest -q tests
 ```
 
-Outputs: `results/eval_P4_T01.md` (submission metrics, first line is the USNs), `results/results.json`,
+Outputs: `results/eval_P4_TigerFC.md` (submission metrics, first line is the USNs), `results/results.json`,
 `results/failures/*.png`, `results/optimization.md`.
 
 ### CLI (used by the agents)
