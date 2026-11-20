@@ -86,6 +86,13 @@ The decision (`dual_path`, `refine`) is computed from the measured input statist
 the UI, the CLI and the agents' messages. This is the brief's "adaptive mechanism to select or combine
 enhancement outputs".
 
+5. **Learned router (optional, `weights/router.json`).** Replaces the hand-set rules in steps 2-3. A ridge
+   regressor on cheap input statistics (scale, holes, noise, texture risk, edge density, LR gradient) predicts the
+   log-RMSE of six paths (CNN on bicubic / on classical / both averaged, each with or without refinement) and picks the best,
+   but only when it beats the rule choice by a margin. Fitted on NYU val 900-999 with image-grouped 5-fold CV
+   (`scripts/train_router.py`, report in `results/router_report.md`), never on test. It also runs only the CNN passes
+   the chosen path needs. Switch "Learned router" off in the UI to compare against the rules.
+
 **Tiled inference.** The net is trained on 128² crops. GroupNorm statistics depend on the spatial
 extent, so whole-image inference made the CNN *worse* than its input (val 4× clean
 0.0445 → 0.0467 m). Running on overlapping 128² tiles blended with a Hann window, the same size as

@@ -11,10 +11,11 @@ import cv2
 import numpy as np
 
 from . import classical as C
+from . import router as R
 from .adaptive import choose_params
 
 METHODS = ["nearest", "bilinear", "bicubic", "classical", "dl", "hybrid"]
-HYBRID_STAGES = ["denoise", "hole_fill", "jbu", "guided", "cnn", "fusion", "refine", "snap"]
+HYBRID_STAGES = ["denoise", "hole_fill", "jbu", "guided", "cnn", "router", "fusion", "refine", "snap"]
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WEIGHTS = Path(os.environ.get("DEPTHFORGE_WEIGHTS", _ROOT / "weights" / "depthforge_net.pt"))
@@ -166,18 +167,37 @@ def run(method: str, lr: np.ndarray, rgb: np.ndarray, stages: dict | None = None
                 notes.append("CNN unavailable -> hybrid fell back to classical")
             out = C.classical_pipeline(lr, rgb, params, {k: st[k] for k in ("denoise", "hole_fill", "jbu", "guided")}, viz)
         else:
-            d_b = run_cnn(bic, rgb)
-            out = d_b
-            if viz is not None:
-                viz["cnn"] = d_b
-            if st["fusion"] and params["dual_path"]:
-                coarse = C.classical_pipeline(lr, rgb, params, {k: st[k] for k in ("denoise", "hole_fill", "jbu", "guided")}, viz)
-                d_c = run_cnn(coarse, rgb)
-                out = 0.5 * (d_b + d_c)
-                notes.append("dual-path fusion: CNN(bicubic) + CNN(classical) averaged (many missing samples)")
-            if st["refine"] and params["refine"]:
-                out = C.guided_filter(rgb, out, 2, 1e-4)
-                notes.append("edge-aware guided refinement applied")
+            cl_keys = {k: st[k] for k in ("denoise", "hole_fill", "jbu", "guided")}
+            rt = R.load() if (st["router"] and st["fusion"] and st["refine"]) else None
+            if rt is not None:
+                # learned router: choose the path from the input statistics, run only what it needs
+                cand = rt.choose(params)
+                need_b, need_c, refine = R.needs(cand)
+                d_b = run_cnn(bic, rgb) if need_b else None
+                d_c = run_cnn(C.classical_pipeline(lr, rgb, params, cl_keys, viz), rgb) if need_c else None
+                outs = [x for x in (d_b, d_c) if x is not None]
+                out = outs[0] if len(outs) == 1 else 0.5 * (outs[0] + outs[1])
+                if viz is not None:
+                    viz["cnn"] = d_b if d_b is not None else d_c
+                if refine:
+                    out = C.guided_filter(rgb, out, 2, 1e-4)
+                params["router_choice"] = cand
+                notes.append(f"learned router chose path '{cand}' "
+                             f"(CNN on {'bicubic' if need_b else ''}{' + ' if need_b and need_c else ''}"
+                             f"{'classical' if need_c else ''} prior{', then guided refinement' if refine else ''})")
+            else:
+                d_b = run_cnn(bic, rgb)
+                out = d_b
+                if viz is not None:
+                    viz["cnn"] = d_b
+                if st["fusion"] and params["dual_path"]:
+                    coarse = C.classical_pipeline(lr, rgb, params, cl_keys, viz)
+                    d_c = run_cnn(coarse, rgb)
+                    out = 0.5 * (d_b + d_c)
+                    notes.append("dual-path fusion: CNN(bicubic) + CNN(classical) averaged (many missing samples)")
+                if st["refine"] and params["refine"]:
+                    out = C.guided_filter(rgb, out, 2, 1e-4)
+                    notes.append("edge-aware guided refinement applied")
         if st["snap"]:
             disc = C.depth_discontinuities(out, params["disc_thresh"])
             out = C.snap_discontinuities(out, C.band(disc, params["band"]), params["snap_k"])
@@ -191,3 +211,18 @@ def run(method: str, lr: np.ndarray, rgb: np.ndarray, stages: dict | None = None
         viz["rgb_edges"] = C.rgb_edges(rgb)
     return dict(depth=out.astype(np.float32), params=params, viz=viz,
                 latency_ms=latency, peak_mem_mb=peak / 2 ** 20, notes=notes)
+
+
+def all_candidates(lr: np.ndarray, rgb: np.ndarray, params: dict | None = None) -> dict:
+    """Every router candidate path for one input (used by scripts/train_router.py).
+    The two CNN passes are computed once and shared."""
+    H, W = rgb.shape[:2]
+    params = params or choose_params(lr, rgb)
+    bic = C.interpolate(C.fill_holes(lr), (H, W), "bicubic")
+    d_b = run_cnn(bic, rgb)
+    d_c = run_cnn(C.classical_pipeline(lr, rgb, params, {k: True for k in ("denoise", "hole_fill", "jbu", "guided")}), rgb)
+    base = {"b": d_b, "c": d_c, "bc": 0.5 * (d_b + d_c)}
+    out = dict(base)
+    for k, v in base.items():
+        out[k + "_ref"] = C.guided_filter(rgb, v, 2, 1e-4)
+    return out

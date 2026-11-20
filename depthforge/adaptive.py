@@ -32,8 +32,13 @@ def analyze(lr: np.ndarray, rgb_hr: np.ndarray) -> dict:
     # wrongly copied into the depth map ("texture-copy risk")
     texture_risk = float((rgb_e & ~dep_e).sum() / edge_px)
     valid = lr[lr > 0]
+    # two cheap extra descriptors used by the learned router (depthforge/router.py)
+    lg = np.log(np.maximum(lr, 1e-3))
+    ok = (lr[:, 1:] > 0) & (lr[:, :-1] > 0)
+    lr_grad = float(np.abs(np.diff(lg, axis=1))[ok].mean()) if ok.any() else 0.0
     return dict(scale=scale, noise=round(noise, 4), holes=round(holes, 4),
                 texture_risk=round(texture_risk, 3),
+                edge_density=round(float(rgb_e.mean()), 4), lr_grad=round(lr_grad, 4),
                 depth_min=float(valid.min()) if valid.size else 0.0,
                 depth_max=float(valid.max()) if valid.size else 0.0)
 

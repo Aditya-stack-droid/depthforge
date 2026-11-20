@@ -32,8 +32,9 @@ from depthforge.model import DepthForgeNet, count_params  # noqa: E402
 
 
 class PatchSet(Dataset):
-    def __init__(self, pairs, crop, length, train=True, seed=0):
+    def __init__(self, pairs, crop, length, train=True, seed=0, jitter=True):
         self.pairs, self.crop, self.length, self.train = pairs, crop, length, train
+        self.jitter = jitter
         self.seed = seed
 
     def __len__(self):
@@ -49,6 +50,9 @@ class PatchSet(Dataset):
         if self.train and rng.random() < 0.5:
             rgb, gt = rgb[:, ::-1], gt[:, ::-1]
         rgb, gt = np.ascontiguousarray(rgb), np.ascontiguousarray(gt)
+        if self.train and self.jitter:  # photometric jitter: depth is unchanged, so the net learns not to trust colour blindly
+            g = rng.uniform(0.7, 1.4); b = rng.uniform(-25, 25)
+            rgb = np.clip(255.0 * (rgb / 255.0) ** g + b, 0, 255).astype(np.uint8)
         gt = C.fill_holes(gt)  # NYU raw has a few zeros; train on dense targets
         scale = rng.choice([2, 4, 8])
         cond = rng.choice(list(degrade.CONDITIONS))
@@ -84,6 +88,9 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--out", default=str(ROOT / "weights" / "depthforge_net.pt"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--amp", action="store_true", help="fp16 autocast on CUDA (about 2x faster on a Colab/Kaggle GPU)")
+    ap.add_argument("--ema", type=float, default=0.999, help="EMA decay of the weights; the EMA copy is validated and saved (0 = off)")
+    ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--init", default=None, help="warm-start from a checkpoint (e.g. the synthetic one)")
     a = ap.parse_args()
     torch.manual_seed(a.seed); random.seed(a.seed); np.random.seed(a.seed)
@@ -110,18 +117,25 @@ def main():
         print("warm start from", a.init)
     print(f"params: {count_params(net):,}")
     opt = torch.optim.AdamW(net.parameters(), a.lr, weight_decay=1e-4)
+    use_amp = a.amp and dev == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    import copy
+    ema = copy.deepcopy(net).eval() if a.ema > 0 else None
+    for p_ in (ema.parameters() if ema else []):
+        p_.requires_grad_(False)
     budget = a.minutes * 60
     t0 = time.time()
     step, best = 0, 1e9
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
 
     def evaluate():
-        net.eval(); tot = n = 0
+        m = ema if ema is not None else net
+        was = net.training; m.eval(); tot = n = 0
         with torch.no_grad():
             for d, r, g in va:
                 d, r, g = d.to(dev), r.to(dev), g.to(dev)
-                tot += F.l1_loss(net(d, r), g, reduction="sum").item(); n += g.numel()
-        net.train(); return tot / n
+                tot += F.l1_loss(m(d, r).float(), g, reduction="sum").item(); n += g.numel()
+        net.train(was); return tot / n
 
     base = None
     for d, r, g in tr:
@@ -131,10 +145,20 @@ def main():
         for pg in opt.param_groups:  # cosine decay over the time budget
             pg["lr"] = a.lr * min(1.0, (step + 1) / 300) * 0.5 * (1 + np.cos(np.pi * min(frac, 1)))
         d, r, g = d.to(dev), r.to(dev), g.to(dev)
-        pred = net(d, r)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            pred = net(d, r)
+        pred = pred.float()
         loss = F.l1_loss(pred, g) + 0.5 * grad_loss(pred, g)
-        opt.zero_grad(); loss.backward(); opt.step(); step += 1
-        if step % 100 == 0 or step == 1:
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        scaler.step(opt); scaler.update(); step += 1
+        if ema is not None:
+            dec = min(a.ema, (1 + step) / (10 + step))
+            with torch.no_grad():
+                for pe, pn in zip(ema.parameters(), net.parameters()):
+                    pe.mul_(dec).add_(pn.detach(), alpha=1 - dec)
+        if step % a.eval_every == 0 or step == 1:
             v = evaluate()
             if base is None:
                 with torch.no_grad():
@@ -142,7 +166,7 @@ def main():
             print(f"step {step:5d}  {time.time()-t0:6.0f}s  loss {loss.item():.4f}  val L1 {v:.5f}  (input L1 {base:.5f})", flush=True)
             if v < best:
                 best = v
-                torch.save(dict(state_dict=net.state_dict(), width=a.width, data=a.data, crop=a.crop,
+                torch.save(dict(state_dict=(ema or net).state_dict(), width=a.width, data=a.data, crop=a.crop,
                                 step=step, val_l1=v, input_val_l1=base), a.out)
     print(f"done: {step} steps, best val L1 {best:.5f} (input {base:.5f}) -> {a.out}")
 

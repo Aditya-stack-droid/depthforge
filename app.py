@@ -14,7 +14,7 @@ import gradio as gr
 import numpy as np
 
 from depthforge import classical as C
-from depthforge import data, degrade, metrics, pipeline, viz
+from depthforge import data, degrade, metrics, pipeline, viewer3d, viz
 
 ROOT = Path(__file__).resolve().parent
 SAMPLES = ROOT / "samples"
@@ -25,6 +25,7 @@ STAGE_LABELS = {
     "jbu": "Joint bilateral upsampling",
     "guided": "Guided filter",
     "cnn": "DepthForge-Net (CNN)",
+    "router": "Learned router (picks the path per image)",
     "fusion": "Dual-path fusion (when many holes)",
     "refine": "Edge-aware refinement",
     "snap": "Boundary snapping",
@@ -115,7 +116,10 @@ def run_one(rgb, depth_file, input_kind, scale, condition, method, stages):
         params["notes"] = r["notes"]
     out = tempfile.NamedTemporaryFile(suffix="_depth_mm.png", delete=False).name
     data.write_depth_png(out, d)
-    return viz.colorize(d, vmin, vmax), gal, m, params, out
+    srcs = {f"Result ({method})": d, "Bicubic": C.interpolate(C.fill_holes(lr), d.shape, "bicubic")}
+    if gt is not None:
+        srcs["Ground truth"] = gt
+    return viz.colorize(d, vmin, vmax), gal, m, params, out, viewer3d.iframe(viewer3d.viewer_html(rgb, srcs))
 
 
 def compare_all(rgb, depth_file, input_kind, scale, condition):
@@ -241,6 +245,9 @@ with gr.Blocks(title="DepthForge · depth upsampling") as demo:
                 with gr.Group(elem_classes="df-card"):
                     par = gr.JSON(label="What the adaptive analysis decided")
             dl = gr.File(label="Download depth (16-bit PNG, millimetres)")
+    with gr.Group(elem_classes="df-card"):
+        gr.Markdown("### 3D view: orbit the result, then flip to Bicubic with Flat shaded geometry to see the edges")
+        view3d = gr.HTML()
     with gr.Accordion("Method comparison: nearest · bilinear · bicubic · classical · DL · hybrid", open=False) as acc:
         table = gr.Dataframe(headers=["method", "RMSE", "MAE", "PSNR", "SSIM", "Edge-RMSE", "Boundary-F1", "ms"])
         cmp_gal = gr.Gallery(columns=7, height=220)
@@ -248,7 +255,7 @@ with gr.Blocks(title="DepthForge · depth upsampling") as demo:
 
     sample.change(load_sample, sample, [rgb_in, depth_in])
     demo.load(load_sample, sample, [rgb_in, depth_in])  # judges can press Run immediately
-    go.click(run_one, [rgb_in, depth_in, kind, scale, cond, method, stages], [result, gallery, met, par, dl])
+    go.click(run_one, [rgb_in, depth_in, kind, scale, cond, method, stages], [result, gallery, met, par, dl, view3d])
     cmp_btn.click(compare_all, [rgb_in, depth_in, kind, scale, cond], [table, cmp_gal]).then(
         lambda: gr.Accordion(open=True), None, acc)
 
