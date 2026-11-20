@@ -120,7 +120,8 @@ def run_one(rgb, depth_file, input_kind, scale, condition, method, stages):
     srcs = {f"Result ({method})": d, "Bicubic": C.interpolate(C.fill_holes(lr), d.shape, "bicubic")}
     if gt is not None:
         srcs["Ground truth"] = gt
-    return viz.colorize(d, vmin, vmax), gal, m, params, out, viewer3d.iframe(viewer3d.viewer_html(rgb, srcs))
+    return (viz.colorize(d, vmin, vmax), gal, m, params, out, viewer3d.iframe(viewer3d.viewer_html(rgb, srcs), 430),
+            viz.colorize(srcs["Bicubic"], vmin, vmax))
 
 
 def compare_all(rgb, depth_file, input_kind, scale, condition):
@@ -183,6 +184,21 @@ body, gradio-app, .gradio-container { background:
   #df-hero .inner { padding:24px 20px; } #df-hero h1 { font-size:30px; }
   #df-steps { grid-template-columns:repeat(2,1fr); }
 }
+.mchips { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; }
+.mc { background:#0f1522; border:1px solid var(--df-line); border-radius:12px; padding:8px 12px; min-width:96px; }
+.mc span { display:block; color:#94a3b8; font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
+.mc b { color:#fff; font-size:16px; }
+.mnote { color:#94a3b8; font-size:12px; margin-top:6px; }
+.dec p { margin:4px 0; color:#cbd5e1; font-size:13px; } .dec b { color:#fff; }
+.df-status { color:#94a3b8; font-size:13px; text-align:center; }
+.df-h p { margin:0 0 6px; color:#cbd5e1; }
+.df-presets { gap:6px !important; flex-wrap:wrap !important; }
+.df-presets button { min-width:0 !important; flex:1 1 40% !important; }
+@media (max-width: 760px) {
+  .gradio-container .row, .gradio-container .form { flex-direction:column !important; }
+  #df-hero { min-height:0; } #df-hero p { font-size:14px; } #df-hero .team { display:none; }
+  .mc { flex:1 1 40%; }
+}
 """.replace("HERO_URI", _HERO_URI)
 
 HERO_HTML = """
@@ -199,11 +215,14 @@ HERO_HTML = """
   </div>
   <div class="team">Team Tiger FC · Aditya Hubbly · Samay Chetan · Shaun · Farhan</div>
 </div></div>
+"""
+
+HOW_HTML = """
 <div id="df-steps">
   <div class="s"><b><span class="n">1</span>Measure</b>noise, holes and texture risk of the input</div>
   <div class="s"><b><span class="n">2</span>Classical</b>denoise → hole fill → joint bilateral → guided filter</div>
   <div class="s"><b><span class="n">3</span>Learn</b>gated RGB-guided CNN predicts a sharp residual</div>
-  <div class="s"><b><span class="n">4</span>Fuse</b>adaptive hybrid picks and combines the outputs</div>
+  <div class="s"><b><span class="n">4</span>Fuse</b>adaptive hybrid (or the learned router) picks and combines the outputs</div>
 </div>
 """
 
@@ -211,54 +230,106 @@ FOOT_HTML = """<div id="df-foot">DepthForge · Team Tiger FC ·
 <a href="https://github.com/Aditya-stack-droid/depthforge" target="_blank">GitHub</a> ·
 trained and evaluated on NYU Depth V2 (unseen test split) · images are processed in memory and not stored</div>"""
 
+PRESETS = {
+    "2× clean": ("2", "clean", "hybrid"),
+    "4× hard sensor": ("4", "hard", "hybrid"),
+    "8× hard sensor": ("8", "hard", "hybrid"),
+    "8× sparse": ("8", "sparse", "hybrid"),
+}
+
+METRIC_FMT = [("rmse", "RMSE", "{:.4f} m"), ("mae", "MAE", "{:.4f} m"), ("psnr", "PSNR", "{:.1f} dB"),
+              ("ssim", "SSIM", "{:.3f}"), ("edge_rmse", "Edge RMSE", "{:.4f} m"),
+              ("boundary_f1", "Boundary F1", "{:.3f}"), ("latency_ms", "Latency", "{:.0f} ms")]
+
+
+def metrics_html(m):
+    chips = "".join(f'<div class="mc"><span>{lab}</span><b>{fmt.format(m[k])}</b></div>'
+                    for k, lab, fmt in METRIC_FMT if k in m and m[k] is not None)
+    if "output_size" in m:
+        chips += f'<div class="mc"><span>Output</span><b>{m["output_size"]}</b></div>'
+    note = "" if "rmse" in m else '<div class="mnote">No ground truth, so accuracy metrics are not available for real low-res input.</div>'
+    return f'<div class="mchips">{chips}</div>{note}'
+
+
+def decisions_html(params, notes):
+    lines = [f'Measured: <b>{params.get("scale")}×</b> upsampling, noise <b>{params.get("noise")}</b>, '
+             f'missing samples <b>{float(params.get("holes", 0)) * 100:.0f}%</b>, texture-copy risk <b>{params.get("texture_risk")}</b>.']
+    if params.get("router_choice"):
+        lines.append(f'Learned router chose path <b>{params["router_choice"]}</b>.')
+    lines += [n[0].upper() + n[1:] + "." if not n.endswith(".") else n[0].upper() + n[1:] for n in notes]
+    lines.append(f'<span style="color:#64748b">CNN: {params.get("cnn_status")}</span>')
+    return '<div class="dec">' + "".join(f"<p>{x}</p>" for x in lines) + "</div>"
+
+
+def _slider(before, after):
+    return (before, after)
+
+
 with gr.Blocks(title="DepthForge · depth upsampling") as demo:
     gr.HTML(HERO_HTML)
     with gr.Row(equal_height=False):
         with gr.Column(scale=1, min_width=320):
             with gr.Group(elem_classes="df-card"):
-                sample = gr.Dropdown(list_samples(), label="1 · Pick a sample (or upload your own below)",
+                sample = gr.Dropdown(list_samples(), label="1 · Pick a sample (or upload your own)",
                                      value=(list_samples() or [None])[0])
-                rgb_in = gr.Image(label="RGB guide image", type="numpy", height=220)
+                rgb_in = gr.Image(label="RGB guide image", type="numpy", height=200)
                 depth_in = gr.File(label="Depth map (.png 16-bit mm / 8-bit / .npy m)",
                                    file_types=[".png", ".npy", ".tif", ".tiff"])
+            with gr.Group(elem_classes="df-card"):
+                gr.Markdown("**2 · Quick start**", elem_classes="df-h")
+                with gr.Row(elem_classes="df-presets"):
+                    preset_btns = {name: gr.Button(name, size="sm", variant="secondary") for name in PRESETS}
+                with gr.Row():
+                    scale = gr.Radio(["2", "4", "8"], value="4", label="Upsampling factor")
+                    cond = gr.Dropdown(list(degrade.CONDITIONS), value="hard", label="Sensor degradation")
+                method = gr.Radio(pipeline.METHODS, value="hybrid", label="Method")
+            with gr.Accordion("Advanced: depth input type and pipeline switches", open=False, elem_classes="df-card"):
                 kind = gr.Radio(["Ground truth depth (simulate sensor, get metrics)", "Low-res depth (real input)"],
                                 value="Ground truth depth (simulate sensor, get metrics)", label="Depth input type")
-            with gr.Group(elem_classes="df-card"):
-                with gr.Row():
-                    scale = gr.Radio(["2", "4", "8"], value="4", label="2 · Upsampling factor")
-                    cond = gr.Dropdown(list(degrade.CONDITIONS), value="hard", label="Sensor degradation")
-                method = gr.Radio(pipeline.METHODS, value="hybrid", label="3 · Method")
                 stages = gr.CheckboxGroup(list(STAGE_LABELS.values()),
                                           value=[v for k, v in STAGE_LABELS.items() if k not in pipeline.OPT_IN],
-                                          label="Pipeline switches: turn stages off to see what each adds")
+                                          label="Turn stages off to see what each one adds")
             go = gr.Button("▶  Run DepthForge", variant="primary", elem_classes="df-run", size="lg")
-            cmp_btn = gr.Button("Compare all 6 methods", variant="secondary")
-            gr.Markdown(f"<span style='color:#64748b;font-size:12px'>CNN: {pipeline.model_status()} · "
-                        "first run after idle may take ~10 s</span>")
+            status = gr.Markdown("Ready. Pick a sample and press Run.", elem_classes="df-status")
         with gr.Column(scale=2, min_width=340):
-            with gr.Group(elem_classes="df-card"):
-                result = gr.Image(label="Result depth (warm = near, cool = far)", height=340)
-            with gr.Group(elem_classes="df-card"):
-                gallery = gr.Gallery(label="Every stage, step by step", columns=4, height=330)
-            with gr.Row():
-                with gr.Group(elem_classes="df-card"):
-                    met = gr.JSON(label="Metrics")
-                with gr.Group(elem_classes="df-card"):
-                    par = gr.JSON(label="What the adaptive analysis decided")
-            dl = gr.File(label="Download depth (16-bit PNG, millimetres)")
-    with gr.Group(elem_classes="df-card"):
-        gr.Markdown("### 3D view: orbit the result, then flip to Bicubic with Flat shaded geometry to see the edges")
-        view3d = gr.HTML()
-    with gr.Accordion("Method comparison: nearest · bilinear · bicubic · classical · DL · hybrid", open=False) as acc:
-        table = gr.Dataframe(headers=["method", "RMSE", "MAE", "PSNR", "SSIM", "Edge-RMSE", "Boundary-F1", "ms"])
-        cmp_gal = gr.Gallery(columns=7, height=220)
+            with gr.Tabs():
+                with gr.Tab("Result"):
+                    if hasattr(gr, "ImageSlider"):
+                        slider = gr.ImageSlider(label="Drag: bicubic (left) vs result (right). Warm = near, cool = far",
+                                                height=360, show_label=True)
+                    else:  # older gradio
+                        slider = gr.Image(label="Result depth (warm = near, cool = far)", height=360)
+                    met = gr.HTML()
+                    dec = gr.HTML()
+                    dl = gr.File(label="Download depth (16-bit PNG, millimetres)")
+                with gr.Tab("Every stage"):
+                    gallery = gr.Gallery(label="Every stage, step by step", columns=3, height=460)
+                with gr.Tab("3D view"):
+                    gr.Markdown("Orbit the result. Switch to **Bicubic** + **Flat shaded geometry** to see the edges.",
+                                elem_classes="df-h")
+                    view3d = gr.HTML()
+                with gr.Tab("Compare methods"):
+                    cmp_btn = gr.Button("Compare all 6 methods", variant="secondary")
+                    table = gr.Dataframe(headers=["method", "RMSE", "MAE", "PSNR", "SSIM", "Edge-RMSE", "Boundary-F1", "ms"])
+                    cmp_gal = gr.Gallery(columns=4, height=260)
+    with gr.Accordion("How it works", open=False, elem_classes="df-card"):
+        gr.HTML(HOW_HTML)
     gr.HTML(FOOT_HTML)
 
+    def run_ui(rgb, depth_file, input_kind, sc, cd, meth, stg):
+        color, gal, m, params, out, view, bic_img = run_one(rgb, depth_file, input_kind, sc, cd, meth, stg)
+        pair = (bic_img, color) if hasattr(gr, "ImageSlider") else color
+        return (pair, gal, metrics_html(m), decisions_html(params, params.get("notes", [])), out, view,
+                f"Done in {m['latency_ms']:.0f} ms · {m['output_size']}")
+
+    for name, vals in PRESETS.items():
+        preset_btns[name].click(lambda v=vals: v, None, [scale, cond, method])
     sample.change(load_sample, sample, [rgb_in, depth_in])
     demo.load(load_sample, sample, [rgb_in, depth_in])  # judges can press Run immediately
-    go.click(run_one, [rgb_in, depth_in, kind, scale, cond, method, stages], [result, gallery, met, par, dl, view3d])
-    cmp_btn.click(compare_all, [rgb_in, depth_in, kind, scale, cond], [table, cmp_gal]).then(
-        lambda: gr.Accordion(open=True), None, acc)
+    go.click(lambda: "⏳ Running… the first run after idle can take ~10 s", None, status, queue=False).then(
+        run_ui, [rgb_in, depth_in, kind, scale, cond, method, stages],
+        [slider, gallery, met, dec, dl, view3d, status])
+    cmp_btn.click(compare_all, [rgb_in, depth_in, kind, scale, cond], [table, cmp_gal])
 
 if __name__ == "__main__":
     FORCE_DARK = "() => { document.body.classList.add('dark'); document.documentElement.classList.add('dark'); }"
