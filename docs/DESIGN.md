@@ -93,6 +93,11 @@ enhancement outputs".
    (`scripts/train_router.py`, report in `results/router_report.md`), never on test. It also runs only the CNN passes
    the chosen path needs. Switch "Learned router" off in the UI to compare against the rules.
 
+6. **Cascade 2x2x2 (opt-in stage `cascade`, 4x/8x only, untested on NYU).** Runs the CNN as repeated 2x steps
+   (8x = 2x, 2x, 2x) with the RGB area-resized to each intermediate size. Hypothesis: the net is best at 2x, so
+   progressive upsampling should help the 8x boundary F1. It is OFF by default. Compare it on NYU **val**
+   (`--on cascade` in the CLI, or the "+ cascade" row of the ablation) and only enable it if it wins there.
+
 **Tiled inference.** The net is trained on 128² crops. GroupNorm statistics depend on the spatial
 extent, so whole-image inference made the CNN *worse* than its input (val 4× clean
 0.0445 → 0.0467 m). Running on overlapping 128² tiles blended with a Hann window, the same size as

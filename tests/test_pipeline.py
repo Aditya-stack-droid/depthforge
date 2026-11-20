@@ -78,3 +78,16 @@ def test_viewer_html(scene):
     assert "WebGL" in page.upper() or "webgl2" in page
     assert "__" not in page.split("<script>")[1].split("const vs")[0]  # all placeholders substituted
     assert viewer3d.iframe(page).startswith("<iframe")
+
+
+@pytest.mark.parametrize("scale", [4, 8])
+def test_cascade_runs_and_is_opt_in(scene, scale):
+    rgb, gt = degrade.crop_to_scale(*scene, scale)
+    lr = degrade.make_lr(gt, scale, *degrade.CONDITIONS["clean"], seed=0)
+    base = pipeline.run("hybrid", lr, rgb)
+    assert not any("cascade" in n for n in base["notes"])
+    if pipeline.load_model() is None:
+        return
+    r = pipeline.run("hybrid", lr, rgb, {"cascade": True})
+    assert r["depth"].shape == gt.shape and np.isfinite(r["depth"]).all()
+    assert any("cascade" in n for n in r["notes"])

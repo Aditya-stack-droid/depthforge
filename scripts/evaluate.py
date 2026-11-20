@@ -100,8 +100,8 @@ def main():
     # ---------------- ablation (hybrid, 4x, hardest condition) -------------- #
     abl_cond = conds[-1]
     abl_rows = []
-    abl_cfgs = [("Full hybrid", {})] + [(f"− {k}", {k: False}) for k in pipeline.HYBRID_STAGES if k != "snap"] \
-        + [("+ snap (opt-in)", {"snap": True})]
+    abl_cfgs = [("Full hybrid", {})] + [(f"− {k}", {k: False}) for k in pipeline.HYBRID_STAGES if k not in pipeline.OPT_IN] \
+        + [("+ snap (opt-in)", {"snap": True}), ("+ cascade 2x2x2 (opt-in)", {"cascade": True})]
     if pipeline.load_model() is None:
         abl_cfgs = [c for c in abl_cfgs if c[0] not in ("− cnn", "− fusion")]
     for label, st in abl_cfgs:

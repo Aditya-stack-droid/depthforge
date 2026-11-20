@@ -29,6 +29,7 @@ STAGE_LABELS = {
     "fusion": "Dual-path fusion (when many holes)",
     "refine": "Edge-aware refinement",
     "snap": "Boundary snapping",
+    "cascade": "Cascade 2x2x2 (4x/8x, experimental)",
 }
 LABEL2KEY = {v: k for k, v in STAGE_LABELS.items()}
 
@@ -228,7 +229,7 @@ with gr.Blocks(title="DepthForge · depth upsampling") as demo:
                     cond = gr.Dropdown(list(degrade.CONDITIONS), value="hard", label="Sensor degradation")
                 method = gr.Radio(pipeline.METHODS, value="hybrid", label="3 · Method")
                 stages = gr.CheckboxGroup(list(STAGE_LABELS.values()),
-                                          value=[v for k, v in STAGE_LABELS.items() if k != "snap"],
+                                          value=[v for k, v in STAGE_LABELS.items() if k not in pipeline.OPT_IN],
                                           label="Pipeline switches: turn stages off to see what each adds")
             go = gr.Button("▶  Run DepthForge", variant="primary", elem_classes="df-run", size="lg")
             cmp_btn = gr.Button("Compare all 6 methods", variant="secondary")

@@ -74,8 +74,8 @@ def cmd_compare(a):
 
 def cmd_ablate(a):
     rows = {}
-    cfgs = [("full", {})] + [(f"no_{k}", {k: False}) for k in pipeline.HYBRID_STAGES if k != "snap"] \
-        + [("with_snap", {"snap": True})]
+    cfgs = [("full", {})] + [(f"no_{k}", {k: False}) for k in pipeline.HYBRID_STAGES if k not in pipeline.OPT_IN] \
+        + [("with_snap", {"snap": True}), ("with_cascade", {"cascade": True})]
     for name, st in cfgs:
         acc = []
         for i in range(a.n):

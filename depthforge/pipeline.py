@@ -14,8 +14,9 @@ from . import classical as C
 from . import router as R
 from .adaptive import choose_params
 
+OPT_IN = ("snap", "cascade")   # stages that are off unless asked for
 METHODS = ["nearest", "bilinear", "bicubic", "classical", "dl", "hybrid"]
-HYBRID_STAGES = ["denoise", "hole_fill", "jbu", "guided", "cnn", "router", "fusion", "refine", "snap"]
+HYBRID_STAGES = ["denoise", "hole_fill", "jbu", "guided", "cnn", "router", "fusion", "refine", "snap", "cascade"]
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WEIGHTS = Path(os.environ.get("DEPTHFORGE_WEIGHTS", _ROOT / "weights" / "depthforge_net.pt"))
@@ -137,6 +138,20 @@ def run_cnn(coarse: np.ndarray, rgb: np.ndarray, tta: bool | None = None) -> np.
     return np.clip(out / wsum * s, 0, None).astype(np.float32)[:H0, :W0]
 
 
+def run_cascade(lr: np.ndarray, rgb: np.ndarray, scale: int) -> np.ndarray:
+    """Progressive upsampling: 4x = 2x then 2x, 8x = 2x,2x,2x. Each step is a 2x problem the
+    CNN handles best; RGB is area-resized to the intermediate resolution. Opt-in (stage
+    'cascade'): validate on NYU val before enabling, see docs/DESIGN.md."""
+    H, W = rgb.shape[:2]
+    cur, s = C.fill_holes(lr), scale
+    while s > 1:
+        s //= 2
+        h, w = H // s, W // s
+        rgb_k = rgb if s == 1 else cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        cur = run_cnn(C.interpolate(cur, (h, w), "bicubic"), rgb_k)
+    return cur
+
+
 def run(method: str, lr: np.ndarray, rgb: np.ndarray, stages: dict | None = None,
         want_viz: bool = False) -> dict:
     """Run one method. Returns dict(depth, params, viz, latency_ms, peak_mem_mb, notes)."""
@@ -145,7 +160,7 @@ def run(method: str, lr: np.ndarray, rgb: np.ndarray, stages: dict | None = None
     H, W = rgb.shape[:2]
     # snapping is opt-in: it helped on piecewise-planar synthetic scenes but hurt
     # on real NYU depth (curved / slanted surfaces), see docs/FAILURE_ANALYSIS.md
-    st = {k: k != "snap" for k in HYBRID_STAGES}
+    st = {k: k not in OPT_IN for k in HYBRID_STAGES}
     st.update(stages or {})
     viz: dict = {} if want_viz else None
     notes = []
@@ -168,8 +183,16 @@ def run(method: str, lr: np.ndarray, rgb: np.ndarray, stages: dict | None = None
             out = C.classical_pipeline(lr, rgb, params, {k: st[k] for k in ("denoise", "hole_fill", "jbu", "guided")}, viz)
         else:
             cl_keys = {k: st[k] for k in ("denoise", "hole_fill", "jbu", "guided")}
-            rt = R.load() if (st["router"] and st["fusion"] and st["refine"]) else None
-            if rt is not None:
+            casc = st["cascade"] and params["scale"] in (4, 8)
+            rt = None if casc else R.load() if (st["router"] and st["fusion"] and st["refine"]) else None
+            if casc:
+                out = run_cascade(lr, rgb, params["scale"])
+                if viz is not None:
+                    viz["cnn"] = out
+                if st["refine"] and params["refine"]:
+                    out = C.guided_filter(rgb, out, 2, 1e-4)
+                notes.append(f"cascade: {params['scale']}x done as {'2x -> 2x' if params['scale'] == 4 else '2x -> 2x -> 2x'} CNN steps")
+            elif rt is not None:
                 # learned router: choose the path from the input statistics, run only what it needs
                 cand = rt.choose(params)
                 need_b, need_c, refine = R.needs(cand)
