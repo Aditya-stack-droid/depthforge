@@ -20,8 +20,9 @@ def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
 
-def viewer_html(rgb: np.ndarray, depths: dict[str, np.ndarray], max_side: int = 480) -> str:
-    """rgb: HxWx3 uint8; depths: {label: HxW float metres}. Returns a standalone HTML page."""
+def payload(rgb: np.ndarray, depths: dict[str, np.ndarray], max_side: int = 480) -> dict:
+    """Mesh data for a viewer: texture (JPEG data URL), depth maps as base64 uint16 millimetres
+    (nearest-neighbour resized so edges stay hard), and a depth range for colouring."""
     H, W = rgb.shape[:2]
     f = min(1.0, max_side / max(H, W))
     h, w = max(2, int(round(H * f))), max(2, int(round(W * f)))
@@ -29,18 +30,23 @@ def viewer_html(rgb: np.ndarray, depths: dict[str, np.ndarray], max_side: int = 
     ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(tex, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
     names, blobs = [], []
     for k, d in depths.items():
-        # nearest-neighbour resize keeps depth edges hard
         dd = cv2.resize(np.nan_to_num(d.astype(np.float32)), (w, h), interpolation=cv2.INTER_NEAREST)
         names.append(k)
         blobs.append(_b64(np.clip(dd * 1000, 0, 65535).astype("<u2").tobytes()))
     ref = next(iter(depths.values()))
     v = ref[ref > 0]
     dmin, dmax = (float(np.percentile(v, 1)), float(np.percentile(v, 99))) if v.size else (0.5, 5.0)
+    return dict(w=w, h=h, tex="data:image/jpeg;base64," + _b64(jpg.tobytes()), names=names, blobs=blobs,
+                dmin=dmin, dmax=dmax)
+
+
+def viewer_html(rgb: np.ndarray, depths: dict[str, np.ndarray], max_side: int = 480) -> str:
+    """rgb: HxWx3 uint8; depths: {label: HxW float metres}. Returns a standalone HTML page."""
     import json
-    return (_PAGE.replace("__W__", str(w)).replace("__H__", str(h)).replace("__NAMES__", json.dumps(names))
-            .replace("__BLOBS__", json.dumps(blobs))
-            .replace("__TEX__", "data:image/jpeg;base64," + _b64(jpg.tobytes()))
-            .replace("__DMIN__", f"{dmin:.4f}").replace("__DMAX__", f"{dmax:.4f}"))
+    d = payload(rgb, depths, max_side)
+    return (_PAGE.replace("__W__", str(d["w"])).replace("__H__", str(d["h"])).replace("__NAMES__", json.dumps(d["names"]))
+            .replace("__BLOBS__", json.dumps(d["blobs"])).replace("__TEX__", d["tex"])
+            .replace("__DMIN__", f"{d['dmin']:.4f}").replace("__DMAX__", f"{d['dmax']:.4f}"))
 
 
 def iframe(page: str, height: int = 460) -> str:

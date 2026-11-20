@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DepthForge · Edge-preserving depth map upsampling</title>
+<meta name="description" content="Upsample low-resolution, noisy depth maps 2×, 4× and 8× while keeping object boundaries sharp.">
+<link rel="stylesheet" href="/static/style.css">
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("df-theme")||"emerald"}catch(e){document.documentElement.dataset.theme="emerald"}</script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <a class="brand" href="#top"><span class="logo" aria-hidden="true"></span><span>Depth<b>Forge</b></span></a>
+    <nav class="links" aria-label="Sections">
+      <a href="#demo">Demo</a><a href="#how">How it works</a><a href="#results">Results</a><a href="#team">Team</a>
+    </nav>
+    <div class="themes" id="themes" role="group" aria-label="Colour theme">
+      <button data-t="emerald" style="background:linear-gradient(135deg,#059669,#84cc16)" title="Emerald" aria-label="Emerald theme"></button>
+      <button data-t="violet" style="background:linear-gradient(135deg,#7c3aed,#ec4899)" title="Violet" aria-label="Violet theme"></button>
+      <button data-t="midnight" style="background:linear-gradient(135deg,#0a0e1a,#22d3ee)" title="Midnight" aria-label="Midnight theme"></button>
+      <button data-t="graphite" style="background:linear-gradient(135deg,#18181b,#71717a)" title="Graphite" aria-label="Graphite theme"></button>
+    </div>
+    <a class="btn ghost sm" href="https://github.com/Aditya-stack-droid/depthforge" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</header>
+
+<main id="top">
+<section class="hero">
+  <div class="wrap hero-in">
+    <div class="hero-copy">
+      <span class="eyebrow">CV Hackathon 2026 · Problem P4</span>
+      <h1>Sharper depth from<br>less data.</h1>
+      <p class="lead">DepthForge turns a low-resolution, noisy, incomplete depth map into a dense high-resolution one at
+        <b>2×, 4× and 8×</b>. It uses the colour photo as a guide, without copying its texture into the geometry.</p>
+      <div class="cta">
+        <a class="btn primary" href="#demo">Try the live demo</a>
+        <a class="btn ghost" href="#results">See the results</a>
+      </div>
+    </div>
+    <div class="hero-stats" id="heroStats">
+      <div class="stat"><b>−34%</b><span>RMSE vs bicubic at 4×<br>(NYU test split)</span></div>
+      <div class="stat"><b>99.1%</b><span>of pixels within 5% of<br>the true depth at 4×</span></div>
+      <div class="stat"><b>0.5 M</b><span>parameter CNN,<br>runs on CPU</span></div>
+      <div class="stat"><b>3</b><span>pipelines: classical,<br>deep learning, hybrid</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="demo" class="section">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>Live demo</h2>
+      <p>Pick an image, choose how much to upsample, and compare DepthForge against plain interpolation.</p>
+    </div>
+
+    <div class="wb">
+      <!-- ============ controls ============ -->
+      <aside class="panel" aria-label="Controls">
+        <div class="group">
+          <div class="label">Input</div>
+          <div class="samples" id="samples" role="listbox" aria-label="Sample images"></div>
+          <div class="uploads">
+            <label class="drop" id="dropRgb"><input type="file" accept="image/png,image/jpeg" hidden>
+              <span class="drop-t">RGB image</span><span class="drop-s" data-empty="PNG or JPEG">PNG or JPEG</span></label>
+            <label class="drop" id="dropDepth"><input type="file" accept=".png,.npy,.tif,.tiff" hidden>
+              <span class="drop-t">Depth map</span><span class="drop-s" data-empty="16-bit PNG, .npy">16-bit PNG, .npy</span></label>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="label">Quick start</div>
+          <div class="chips" id="presets">
+            <button class="chip" data-p="2,clean,hybrid">2× clean</button>
+            <button class="chip" data-p="4,hard,hybrid">4× hard sensor</button>
+            <button class="chip" data-p="8,hard,hybrid">8× hard sensor</button>
+            <button class="chip" data-p="8,sparse,hybrid">8× sparse</button>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="label">Upsampling factor</div>
+          <div class="seg" id="segScale" role="radiogroup"><button data-v="2">2×</button><button data-v="4" class="on">4×</button><button data-v="8">8×</button></div>
+        </div>
+
+        <div class="group">
+          <div class="label">Sensor degradation <span class="hint" id="condInfo"></span></div>
+          <select id="cond" aria-label="Sensor degradation"></select>
+        </div>
+
+        <div class="group">
+          <div class="label">Method</div>
+          <div class="seg wrap-seg" id="segMethod" role="radiogroup"></div>
+        </div>
+
+        <details class="group adv">
+          <summary>Advanced</summary>
+          <div class="label mt">Depth input type</div>
+          <div class="seg" id="segKind">
+            <button data-v="gt" class="on" title="Treat the depth map as ground truth and simulate a low-res sensor">Simulate sensor</button>
+            <button data-v="lr" title="The depth map you upload is already low resolution">Real low-res</button>
+          </div>
+          <div class="label mt">Pipeline stages</div>
+          <div class="toggles" id="stages"></div>
+        </details>
+
+        <button class="btn primary run" id="run"><span class="run-t">Run DepthForge</span><span class="spin" aria-hidden="true"></span></button>
+        <p class="status" id="status" aria-live="polite">Ready.</p>
+      </aside>
+
+      <!-- ============ output ============ -->
+      <div class="stage" id="stage">
+        <div class="tabs" role="tablist">
+          <button role="tab" class="on" data-tab="compare">Compare</button>
+          <button role="tab" data-tab="stages">Stages</button>
+          <button role="tab" data-tab="view3d">3D view</button>
+          <button role="tab" data-tab="methods">All methods</button>
+        </div>
+        <div class="loadbar" id="loadbar" aria-hidden="true"></div>
+
+        <!-- Compare -->
+        <div class="pane on" data-pane="compare">
+          <div class="cmp-bar">
+            <label>Left <select id="selLeft"></select></label>
+            <span class="vs">vs</span>
+            <label>Right <select id="selRight"></select></label>
+            <span class="tip">Drag the divider, or use the arrow keys</span>
+          </div>
+          <div class="cmp" id="cmp" tabindex="0" aria-label="Before and after comparison slider">
+            <img id="imgR" alt="" draggable="false"><img id="imgL" alt="" draggable="false">
+            <div class="cap l" id="capL"></div><div class="cap r" id="capR"></div>
+            <div class="handle" id="handle"><span></span></div>
+            <div class="empty" id="empty">Pick a sample and press <b>Run DepthForge</b></div>
+          </div>
+          <div class="mchips" id="mchips"></div>
+          <ul class="decisions" id="decisions"></ul>
+          <a class="btn ghost sm dl" id="dl" download="depthforge_depth_mm.png" hidden>Download depth (16-bit PNG, mm)</a>
+        </div>
+
+        <!-- Stages -->
+        <div class="pane" data-pane="stages"><div class="grid" id="stageGrid"><p class="muted">Run the pipeline to see every stage.</p></div></div>
+
+        <!-- 3D -->
+        <div class="pane" data-pane="view3d">
+          <div class="v3-bar">
+            <label>Depth <select id="v3src"></select></label>
+            <label>Shading <select id="v3mode"><option value="2">Flat geometry</option><option value="0">RGB texture</option><option value="1">Depth colours</option></select></label>
+            <label>Tear edges <input id="v3cut" type="range" min="1" max="60" value="12"></label>
+            <label class="chk"><input id="v3sway" type="checkbox" checked> Auto-orbit</label>
+          </div>
+          <div class="v3" id="v3wrap"><canvas id="v3"></canvas><div class="v3hint">Drag to orbit · scroll to zoom. Compare <b>Bicubic</b> with the result in <b>Flat geometry</b> to see the edges.</div></div>
+        </div>
+
+        <!-- Methods -->
+        <div class="pane" data-pane="methods">
+          <div class="row-between"><p class="muted">Runs all six methods on the current input and scores them against the ground truth.</p>
+            <button class="btn ghost sm" id="cmpAll">Compare all methods</button></div>
+          <div id="cmpOut"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="section alt">
+  <div class="wrap">
+    <div class="sec-head"><h2>How it works</h2><p>Every input is measured first, then the pipeline adapts to it.</p></div>
+    <ol class="steps">
+      <li><span class="n">1</span><h3>Measure</h3><p>Noise level, fraction of missing samples, and how much colour texture has no matching depth edge.</p></li>
+      <li><span class="n">2</span><h3>Classical</h3><p>Denoise, fill large holes, joint bilateral upsampling and a guided filter, tuned from the measurements.</p></li>
+      <li><span class="n">3</span><h3>Learn</h3><p>A 0.5 M-parameter CNN predicts a residual. A learned gate decides how much colour to trust.</p></li>
+      <li><span class="n">4</span><h3>Combine</h3><p>The hybrid picks and fuses paths per image, so it is never blindly trusting one estimator.</p></li>
+    </ol>
+  </div>
+</section>
+
+<section id="results" class="section">
+  <div class="wrap">
+    <div class="sec-head"><h2>Results</h2><p>Measured on unseen NYU Depth V2 test images (never used for training or tuning). Lower RMSE is better.</p></div>
+    <div class="res-bar">
+      <div class="seg" id="segResCond"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="chart" id="chart" role="img" aria-label="RMSE by method and upsampling factor"></div>
+    <p class="muted small" id="resNote"></p>
+  </div>
+</section>
+
+<section id="team" class="section alt">
+  <div class="wrap team">
+    <div><h2>Team Tiger FC</h2>
+      <p class="muted">Built for the CV Hackathon 2026, problem P4: edge-preserving depth map upsampling and refinement.</p></div>
+    <ul class="people"><li>Aditya Hubbly</li><li>Samay Chetan</li><li>Shaun</li><li>Farhan</li></ul>
+  </div>
+</section>
+</main>
+
+<footer class="foot"><div class="wrap">
+  <span>DepthForge · Team Tiger FC</span>
+  <span>Uploads are processed in memory and not stored.</span>
+  <a href="https://github.com/Aditya-stack-droid/depthforge" target="_blank" rel="noopener">Source on GitHub</a>
+</div></footer>
+
+<div class="toasts" id="toasts" aria-live="assertive"></div>
+<script src="/static/app.js" defer></script>
+</body>
+</html>

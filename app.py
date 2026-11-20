@@ -1,7 +1,8 @@
-"""DepthForge — Gradio "switchboard" app.
+"""DepthForge web app: a FastAPI server that serves the website (web/) and a small JSON API.
 
-Flip pipeline stages on/off, pick 2x/4x/8x and a degradation, and see every
-intermediate result plus live metrics. Runs on CPU (Docker / HF Spaces).
+  python app.py          # http://localhost:7860
+
+The previous Gradio UI is kept in app_gradio.py.
 """
 from __future__ import annotations
 
@@ -10,337 +11,100 @@ import tempfile
 from pathlib import Path
 
 import cv2
-import gradio as gr
 import numpy as np
+import uvicorn
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
-from depthforge import classical as C
-from depthforge import data, degrade, metrics, pipeline, viewer3d, viz
+from depthforge import data, service
 
 ROOT = Path(__file__).resolve().parent
-SAMPLES = ROOT / "samples"
-MAX_SIDE = 960          # keeps every request well under the 10 s budget on CPU
-STAGE_LABELS = {
-    "denoise": "Adaptive denoise",
-    "hole_fill": "Hole filling",
-    "jbu": "Joint bilateral upsampling",
-    "guided": "Guided filter",
-    "cnn": "DepthForge-Net (CNN)",
-    "router": "Learned router (picks the path per image)",
-    "fusion": "Dual-path fusion (when many holes)",
-    "refine": "Edge-aware refinement",
-    "snap": "Boundary snapping",
-    "cascade": "Cascade 2x2x2 (4x/8x, experimental)",
-}
-LABEL2KEY = {v: k for k, v in STAGE_LABELS.items()}
+WEB = ROOT / "web"
+MAX_UPLOAD = 25 * 2 ** 20
+
+app = FastAPI(title="DepthForge", docs_url="/api/docs", redoc_url=None)
 
 
-def list_samples():
-    return sorted(p.name[:-8] for p in SAMPLES.glob("*_rgb.png"))
+@app.exception_handler(service.RequestError)
+async def _bad_request(_, e: service.RequestError):
+    return JSONResponse({"error": str(e)}, status_code=400)
 
 
-def load_sample(name):
-    if not name:
-        return None, None
-    rgb = cv2.cvtColor(cv2.imread(str(SAMPLES / f"{name}_rgb.png")), cv2.COLOR_BGR2RGB)
-    return rgb, str(SAMPLES / f"{name}_depth.png")
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 
-def _prepare(rgb, depth_file, input_kind, scale, condition):
-    if rgb is None:
-        raise gr.Error("Please upload an RGB guide image (or pick a sample).")
-    if depth_file is None:
-        raise gr.Error("Please upload a depth map (.png 16-bit mm, 8-bit relative, or .npy metres).")
-    path = depth_file if isinstance(depth_file, str) else depth_file.name
+@app.get("/api/config")
+def api_config():
+    return service.config()
+
+
+@app.get("/api/results")
+def api_results():
+    return service.results_summary()
+
+
+@app.get("/api/thumb/{name}")
+def api_thumb(name: str):
+    return Response(service.thumbnail(name), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
+async def _read_inputs(sample, rgb, depth):
+    if sample:
+        return service.load_sample(sample)
+    if rgb is None or depth is None:
+        raise service.RequestError("Choose a sample, or upload both an RGB image and a depth map.")
+    rb, db = await rgb.read(), await depth.read()
+    if len(rb) > MAX_UPLOAD or len(db) > MAX_UPLOAD:
+        raise service.RequestError("Files must be smaller than 25 MB.")
+    img = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise service.RequestError("Could not read the RGB image (use PNG or JPEG).")
+    suffix = Path(depth.filename or "d.png").suffix.lower() or ".png"
+    if suffix not in (".png", ".npy", ".tif", ".tiff"):
+        raise service.RequestError("Depth must be a .png (16-bit mm or 8-bit), .tif or .npy (metres) file.")
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(db)
     try:
-        depth = data.read_depth(path)
+        d = data.read_depth(f.name)
     except Exception as e:
-        raise gr.Error(f"Could not read depth file: {e}")
-    if rgb.ndim == 2:
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
-    rgb = rgb[..., :3].astype(np.uint8)
-    if not np.isfinite(depth).all():
-        depth = np.nan_to_num(depth, nan=0, posinf=0, neginf=0)
-    if (depth > 0).mean() < 0.01:
-        raise gr.Error("Depth map is (almost) empty — fewer than 1% valid pixels.")
-    scale = int(scale)
-    gt = None
-    if input_kind.startswith("Ground truth"):
-        # Simulate a low-res sensor from a dense depth map -> metrics available
-        if depth.shape != rgb.shape[:2]:
-            depth = cv2.resize(depth, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-        f = min(1.0, MAX_SIDE / max(rgb.shape[:2]))
-        if f < 1:
-            rgb = cv2.resize(rgb, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-            depth = cv2.resize(depth, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-        rgb, gt = degrade.crop_to_scale(rgb, depth, scale)
-        lr = degrade.make_lr(gt, scale, *degrade.CONDITIONS[condition], seed=0)
-    else:
-        # Real low-res depth: output size = depth size x scale; RGB resized to match
-        lr = depth
-        H, W = lr.shape[0] * scale, lr.shape[1] * scale
-        if max(H, W) > MAX_SIDE * 1.5:
-            raise gr.Error(f"Output would be {W}x{H}; choose a smaller factor or a smaller depth map.")
-        if rgb.shape[0] / rgb.shape[1] and abs(rgb.shape[0] / rgb.shape[1] - H / W) > 0.05:
-            gr.Warning("RGB and depth aspect ratios differ — RGB was resized to match.")
-        rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
-    return rgb, lr, gt
+        raise service.RequestError(f"Could not read the depth file: {e}")
+    finally:
+        os.unlink(f.name)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), d
 
 
-def run_one(rgb, depth_file, input_kind, scale, condition, method, stages):
-    rgb, lr, gt = _prepare(rgb, depth_file, input_kind, scale, condition)
-    st = {k: (STAGE_LABELS[k] in (stages or [])) for k in pipeline.HYBRID_STAGES}
-    if method == "dl" and pipeline.load_model() is None:
-        raise gr.Error("CNN checkpoint not found — run scripts/train.py or choose classical/hybrid.")
-    r = pipeline.run(method, lr, rgb, st, want_viz=True)
-    d = r["depth"]
-    vmin, vmax = (np.percentile(gt[gt > 0], 1), np.percentile(gt[gt > 0], 99)) if gt is not None else (None, None)
-    gal = [(rgb, "RGB guide"), (viz.nn_upscale(viz.colorize(lr, vmin, vmax), d.shape), f"Low-res input ({lr.shape[1]}x{lr.shape[0]})")]
-    v = r["viz"] or {}
-    if "upsampled" in v:
-        gal.append((viz.colorize(v["upsampled"], vmin, vmax), "After JBU / interpolation"))
-    gal.append((viz.mask_overlay(rgb, v["rgb_edges"], (255, 255, 0)), "RGB edges (Canny)"))
-    if "discontinuities" in v:
-        gal.append((viz.mask_overlay(rgb, v["discontinuities"]), "Detected depth discontinuities"))
-    if "cnn" in v:
-        gal.append((viz.colorize(v["cnn"], vmin, vmax), "CNN output (bicubic prior)"))
-    gal.append((viz.colorize(d, vmin, vmax), f"Result — {method}"))
-    if gt is not None:
-        gal.append((viz.colorize(gt, vmin, vmax), "Ground truth"))
-        gal.append((viz.error_map(d, gt), "|error| (bright = worse)"))
-    m = metrics.all_metrics(d, gt) if gt is not None else {}
-    m.update(latency_ms=round(r["latency_ms"], 1), peak_mem_mb=round(r["peak_mem_mb"], 1),
-             output_size=f"{d.shape[1]}x{d.shape[0]}")
-    m = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
-    params = {k: v for k, v in r["params"].items()}
-    params["cnn_status"] = pipeline.model_status()
-    if r["notes"]:
-        params["notes"] = r["notes"]
-    out = tempfile.NamedTemporaryFile(suffix="_depth_mm.png", delete=False).name
-    data.write_depth_png(out, d)
-    srcs = {f"Result ({method})": d, "Bicubic": C.interpolate(C.fill_holes(lr), d.shape, "bicubic")}
-    if gt is not None:
-        srcs["Ground truth"] = gt
-    return (viz.colorize(d, vmin, vmax), gal, m, params, out, viewer3d.iframe(viewer3d.viewer_html(rgb, srcs), 430),
-            viz.colorize(srcs["Bicubic"], vmin, vmax))
+@app.post("/api/run")
+async def api_run(sample: str = Form(None), rgb: UploadFile = File(None), depth: UploadFile = File(None),
+                  kind: str = Form("gt"), scale: int = Form(4), condition: str = Form("hard"),
+                  method: str = Form("hybrid"), off: str = Form(""), on: str = Form("")):
+    img, d = await _read_inputs(sample, rgb, depth)
+    split = lambda s: [x for x in s.split(",") if x]
+    return await run_in_threadpool(service.run_request, img, d, kind == "gt", scale, condition, method,
+                                   split(off), split(on))
 
 
-def compare_all(rgb, depth_file, input_kind, scale, condition):
-    if not input_kind.startswith("Ground truth"):
-        raise gr.Error("Comparison needs ground truth — choose 'Ground truth depth' as the input type.")
-    rgb, lr, gt = _prepare(rgb, depth_file, input_kind, scale, condition)
-    rows, imgs = [], []
-    vmin, vmax = np.percentile(gt[gt > 0], 1), np.percentile(gt[gt > 0], 99)
-    for m in pipeline.METHODS:
-        if m == "dl" and pipeline.load_model() is None:
-            continue
-        r = pipeline.run(m, lr, rgb)
-        mm = metrics.all_metrics(r["depth"], gt)
-        rows.append([m, *(round(mm[k], 4) for k in ("rmse", "mae", "psnr", "ssim", "edge_rmse", "boundary_f1")),
-                     round(r["latency_ms"], 1)])
-        imgs.append((viz.colorize(r["depth"], vmin, vmax), f"{m}  RMSE {mm['rmse']:.3f}"))
-    imgs.append((viz.colorize(gt, vmin, vmax), "ground truth"))
-    return rows, imgs
+@app.post("/api/compare")
+async def api_compare(sample: str = Form(None), rgb: UploadFile = File(None), depth: UploadFile = File(None),
+                      scale: int = Form(4), condition: str = Form("hard")):
+    img, d = await _read_inputs(sample, rgb, depth)
+    return await run_in_threadpool(service.compare_request, img, d, scale, condition)
 
 
-import base64 as _b64
-
-_HERO = ROOT / "assets" / "hero.jpg"
-_HERO_URI = ("data:image/jpeg;base64," + _b64.b64encode(_HERO.read_bytes()).decode()) if _HERO.exists() else ""
-
-CSS = """
-:root, .dark { --df-bg:#0b0f17; --df-card:#121826; --df-line:#232b3b; --df-acc:#ff7a1a; --df-acc2:#22d3ee; }
-body, gradio-app, .gradio-container { background:
-    radial-gradient(1200px 600px at 10% -10%, rgba(34,211,238,.10), transparent 60%),
-    radial-gradient(900px 500px at 110% 10%, rgba(255,122,26,.10), transparent 60%),
-    var(--df-bg) !important; }
-.gradio-container { max-width: 1320px !important; margin: 0 auto !important; }
-#df-hero { position:relative; border-radius:22px; overflow:hidden; min-height:300px; margin:8px 0 18px;
-    background: linear-gradient(90deg, rgba(8,11,18,.92) 0%, rgba(8,11,18,.62) 48%, rgba(8,11,18,.0) 100%),
-                url('HERO_URI') center/cover no-repeat;
-    border:1px solid var(--df-line); box-shadow: 0 20px 60px rgba(0,0,0,.45); }
-#df-hero .inner { padding:38px 40px 32px; max-width:760px; }
-#df-hero .kicker { display:inline-block; font:600 12px/1 ui-monospace,monospace; letter-spacing:.14em;
-    color:#0b0f17; background:var(--df-acc2); padding:6px 10px; border-radius:999px; }
-#df-hero h1 { font-size:44px; line-height:1.05; margin:14px 0 10px; color:#fff; font-weight:800; letter-spacing:-.02em; }
-#df-hero h1 span { background:linear-gradient(90deg,#22d3ee,#a3e635,#facc15,#fb923c,#ef4444);
-    -webkit-background-clip:text; background-clip:text; color:transparent; }
-#df-hero p { color:#cbd5e1; font-size:16px; margin:0 0 18px; }
-#df-hero .chips { display:flex; flex-wrap:wrap; gap:8px; }
-#df-hero .chip { background:rgba(15,23,42,.72); border:1px solid rgba(148,163,184,.25); color:#e2e8f0;
-    border-radius:12px; padding:8px 12px; font-size:13px; backdrop-filter: blur(6px); }
-#df-hero .chip b { color:#fff; font-size:15px; }
-#df-hero .team { margin-top:16px; color:#94a3b8; font-size:13px; }
-#df-steps { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:0 0 16px; }
-#df-steps .s { background:var(--df-card); border:1px solid var(--df-line); border-radius:14px; padding:12px 14px; color:#cbd5e1; font-size:13px; }
-#df-steps .s b { display:block; color:#fff; font-size:14px; margin-bottom:2px; }
-#df-steps .n { color:var(--df-acc); font-weight:800; margin-right:6px; }
-.df-card { background:var(--df-card) !important; border:1px solid var(--df-line) !important; border-radius:16px !important; padding:10px !important; }
-.df-run button, button.df-run { background:linear-gradient(90deg,#ff7a1a,#ef4444) !important; color:#fff !important; border:none !important;
-    font-weight:700 !important; font-size:16px !important; box-shadow:0 8px 24px rgba(239,68,68,.35) !important; }
-.gradio-container .block, .gradio-container .form, .gradio-container .image-container { border-color: var(--df-line) !important; }
-#df-foot { text-align:center; color:#64748b; font-size:12px; padding:18px 0 4px; }
-#df-foot a { color:#94a3b8; }
-@media (max-width: 760px) {
-  #df-hero .inner { padding:24px 20px; } #df-hero h1 { font-size:30px; }
-  #df-steps { grid-template-columns:repeat(2,1fr); }
-}
-.mchips { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; }
-.mc { background:#0f1522; border:1px solid var(--df-line); border-radius:12px; padding:8px 12px; min-width:96px; }
-.mc span { display:block; color:#94a3b8; font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
-.mc b { color:#fff; font-size:16px; }
-.mnote { color:#94a3b8; font-size:12px; margin-top:6px; }
-.dec p { margin:4px 0; color:#cbd5e1; font-size:13px; } .dec b { color:#fff; }
-.df-status { color:#94a3b8; font-size:13px; text-align:center; }
-.df-h p { margin:0 0 6px; color:#cbd5e1; }
-.df-presets { gap:6px !important; flex-wrap:wrap !important; }
-.df-presets button { min-width:0 !important; flex:1 1 40% !important; }
-@media (max-width: 760px) {
-  .gradio-container .row, .gradio-container .form { flex-direction:column !important; }
-  #df-hero { min-height:0; } #df-hero p { font-size:14px; } #df-hero .team { display:none; }
-  .mc { flex:1 1 40%; }
-}
-""".replace("HERO_URI", _HERO_URI)
-
-HERO_HTML = """
-<div id="df-hero"><div class="inner">
-  <span class="kicker">CV HACKATHON 2026 · P4</span>
-  <h1>Depth<span>Forge</span></h1>
-  <p>Turns a low-resolution, noisy, holey depth map into sharp high-resolution depth at <b>2× / 4× / 8×</b>,
-     using the colour photo as a guide without copying its texture into the geometry.</p>
-  <div class="chips">
-    <div class="chip"><b>−34%</b> RMSE vs bicubic (4×, NYU)</div>
-    <div class="chip"><b>99.1%</b> pixels within 5% of truth (4×)</div>
-    <div class="chip"><b>0.5 M</b> param CNN · CPU</div>
-    <div class="chip"><b>3</b> pipelines: classical · DL · hybrid</div>
-  </div>
-  <div class="team">Team Tiger FC · Aditya Hubbly · Samay Chetan · Shaun · Farhan</div>
-</div></div>
-"""
-
-HOW_HTML = """
-<div id="df-steps">
-  <div class="s"><b><span class="n">1</span>Measure</b>noise, holes and texture risk of the input</div>
-  <div class="s"><b><span class="n">2</span>Classical</b>denoise → hole fill → joint bilateral → guided filter</div>
-  <div class="s"><b><span class="n">3</span>Learn</b>gated RGB-guided CNN predicts a sharp residual</div>
-  <div class="s"><b><span class="n">4</span>Fuse</b>adaptive hybrid (or the learned router) picks and combines the outputs</div>
-</div>
-"""
-
-FOOT_HTML = """<div id="df-foot">DepthForge · Team Tiger FC ·
-<a href="https://github.com/Aditya-stack-droid/depthforge" target="_blank">GitHub</a> ·
-trained and evaluated on NYU Depth V2 (unseen test split) · images are processed in memory and not stored</div>"""
-
-PRESETS = {
-    "2× clean": ("2", "clean", "hybrid"),
-    "4× hard sensor": ("4", "hard", "hybrid"),
-    "8× hard sensor": ("8", "hard", "hybrid"),
-    "8× sparse": ("8", "sparse", "hybrid"),
-}
-
-METRIC_FMT = [("rmse", "RMSE", "{:.4f} m"), ("mae", "MAE", "{:.4f} m"), ("psnr", "PSNR", "{:.1f} dB"),
-              ("ssim", "SSIM", "{:.3f}"), ("edge_rmse", "Edge RMSE", "{:.4f} m"),
-              ("boundary_f1", "Boundary F1", "{:.3f}"), ("latency_ms", "Latency", "{:.0f} ms")]
+@app.get("/")
+def index():
+    # cache-bust the static files by mtime so a redeploy is picked up immediately
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for f in ("style.css", "app.js"):
+        html = html.replace(f"/static/{f}", f"/static/{f}?v={int((WEB / f).stat().st_mtime)}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
-def metrics_html(m):
-    chips = "".join(f'<div class="mc"><span>{lab}</span><b>{fmt.format(m[k])}</b></div>'
-                    for k, lab, fmt in METRIC_FMT if k in m and m[k] is not None)
-    if "output_size" in m:
-        chips += f'<div class="mc"><span>Output</span><b>{m["output_size"]}</b></div>'
-    note = "" if "rmse" in m else '<div class="mnote">No ground truth, so accuracy metrics are not available for real low-res input.</div>'
-    return f'<div class="mchips">{chips}</div>{note}'
-
-
-def decisions_html(params, notes):
-    lines = [f'Measured: <b>{params.get("scale")}×</b> upsampling, noise <b>{params.get("noise")}</b>, '
-             f'missing samples <b>{float(params.get("holes", 0)) * 100:.0f}%</b>, texture-copy risk <b>{params.get("texture_risk")}</b>.']
-    if params.get("router_choice"):
-        lines.append(f'Learned router chose path <b>{params["router_choice"]}</b>.')
-    lines += [n[0].upper() + n[1:] + "." if not n.endswith(".") else n[0].upper() + n[1:] for n in notes]
-    lines.append(f'<span style="color:#64748b">CNN: {params.get("cnn_status")}</span>')
-    return '<div class="dec">' + "".join(f"<p>{x}</p>" for x in lines) + "</div>"
-
-
-def _slider(before, after):
-    return (before, after)
-
-
-with gr.Blocks(title="DepthForge · depth upsampling") as demo:
-    gr.HTML(HERO_HTML)
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1, min_width=320):
-            with gr.Group(elem_classes="df-card"):
-                sample = gr.Dropdown(list_samples(), label="1 · Pick a sample (or upload your own)",
-                                     value=(list_samples() or [None])[0])
-                rgb_in = gr.Image(label="RGB guide image", type="numpy", height=200)
-                depth_in = gr.File(label="Depth map (.png 16-bit mm / 8-bit / .npy m)",
-                                   file_types=[".png", ".npy", ".tif", ".tiff"])
-            with gr.Group(elem_classes="df-card"):
-                gr.Markdown("**2 · Quick start**", elem_classes="df-h")
-                with gr.Row(elem_classes="df-presets"):
-                    preset_btns = {name: gr.Button(name, size="sm", variant="secondary") for name in PRESETS}
-                with gr.Row():
-                    scale = gr.Radio(["2", "4", "8"], value="4", label="Upsampling factor")
-                    cond = gr.Dropdown(list(degrade.CONDITIONS), value="hard", label="Sensor degradation")
-                method = gr.Radio(pipeline.METHODS, value="hybrid", label="Method")
-            with gr.Accordion("Advanced: depth input type and pipeline switches", open=False, elem_classes="df-card"):
-                kind = gr.Radio(["Ground truth depth (simulate sensor, get metrics)", "Low-res depth (real input)"],
-                                value="Ground truth depth (simulate sensor, get metrics)", label="Depth input type")
-                stages = gr.CheckboxGroup(list(STAGE_LABELS.values()),
-                                          value=[v for k, v in STAGE_LABELS.items() if k not in pipeline.OPT_IN],
-                                          label="Turn stages off to see what each one adds")
-            go = gr.Button("▶  Run DepthForge", variant="primary", elem_classes="df-run", size="lg")
-            status = gr.Markdown("Ready. Pick a sample and press Run.", elem_classes="df-status")
-        with gr.Column(scale=2, min_width=340):
-            with gr.Tabs():
-                with gr.Tab("Result"):
-                    if hasattr(gr, "ImageSlider"):
-                        slider = gr.ImageSlider(label="Drag: bicubic (left) vs result (right). Warm = near, cool = far",
-                                                height=360, show_label=True)
-                    else:  # older gradio
-                        slider = gr.Image(label="Result depth (warm = near, cool = far)", height=360)
-                    met = gr.HTML()
-                    dec = gr.HTML()
-                    dl = gr.File(label="Download depth (16-bit PNG, millimetres)")
-                with gr.Tab("Every stage"):
-                    gallery = gr.Gallery(label="Every stage, step by step", columns=3, height=460)
-                with gr.Tab("3D view"):
-                    gr.Markdown("Orbit the result. Switch to **Bicubic** + **Flat shaded geometry** to see the edges.",
-                                elem_classes="df-h")
-                    view3d = gr.HTML()
-                with gr.Tab("Compare methods"):
-                    cmp_btn = gr.Button("Compare all 6 methods", variant="secondary")
-                    table = gr.Dataframe(headers=["method", "RMSE", "MAE", "PSNR", "SSIM", "Edge-RMSE", "Boundary-F1", "ms"])
-                    cmp_gal = gr.Gallery(columns=4, height=260)
-    with gr.Accordion("How it works", open=False, elem_classes="df-card"):
-        gr.HTML(HOW_HTML)
-    gr.HTML(FOOT_HTML)
-
-    def run_ui(rgb, depth_file, input_kind, sc, cd, meth, stg):
-        color, gal, m, params, out, view, bic_img = run_one(rgb, depth_file, input_kind, sc, cd, meth, stg)
-        pair = (bic_img, color) if hasattr(gr, "ImageSlider") else color
-        return (pair, gal, metrics_html(m), decisions_html(params, params.get("notes", [])), out, view,
-                f"Done in {m['latency_ms']:.0f} ms · {m['output_size']}")
-
-    for name, vals in PRESETS.items():
-        preset_btns[name].click(lambda v=vals: v, None, [scale, cond, method])
-    sample.change(load_sample, sample, [rgb_in, depth_in])
-    demo.load(load_sample, sample, [rgb_in, depth_in])  # judges can press Run immediately
-    go.click(lambda: "⏳ Running… the first run after idle can take ~10 s", None, status, queue=False).then(
-        run_ui, [rgb_in, depth_in, kind, scale, cond, method, stages],
-        [slider, gallery, met, dec, dl, view3d, status])
-    cmp_btn.click(compare_all, [rgb_in, depth_in, kind, scale, cond], [table, cmp_gal])
+app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
+app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 if __name__ == "__main__":
-    FORCE_DARK = "() => { document.body.classList.add('dark'); document.documentElement.classList.add('dark'); }"
-    THEME = gr.themes.Base(primary_hue="orange", secondary_hue="cyan", neutral_hue="slate",
-                           font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"]).set(
-        body_background_fill="#0b0f17", body_background_fill_dark="#0b0f17",
-        block_background_fill="#121826", block_background_fill_dark="#121826",
-        block_border_color="#232b3b", block_border_color_dark="#232b3b",
-        body_text_color="#e2e8f0", body_text_color_dark="#e2e8f0",
-        block_label_text_color="#94a3b8", block_label_text_color_dark="#94a3b8",
-        input_background_fill="#0f1522", input_background_fill_dark="#0f1522",
-        border_color_primary="#232b3b", border_color_primary_dark="#232b3b")
-    demo.queue(max_size=16).launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)),
-                                   css=CSS, theme=THEME, js=FORCE_DARK)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)), log_level="warning")

@@ -15,7 +15,7 @@ Team Tiger FC: Aditya Hubbly 1RUA24CSE0021, Samay Chetan 1RUA24CSE0401, Shaun 1R
   - `router.py`: learned per-image router (ridge on input stats picks the hybrid path; `weights/router.json`, optional, falls back to the hand-set rules)
   - `viewer3d.py`: offline WebGL2 3D viewer embedded in the app
   - `metrics.py`, `degrade.py`, `data.py` (NYU loader, synthetic scenes), `viz.py`, `cli.py` (JSON CLI)
-- `app.py`: Gradio UI (dark theme, hero image `assets/hero.jpg`)
+- `app.py`: FastAPI server: serves the website in `web/` (index.html, style.css, app.js, light theme, CSS variables in `:root`) and the JSON API (`/api/config`, `/api/run`, `/api/compare`, `/api/results`, `/api/thumb/<name>`). `depthforge/service.py` holds the request logic. `app_gradio.py` is the old Gradio UI, kept as a fallback.
 - `scripts/`:
   - `train.py` (`--amp --ema`), `train_router.py`, `evaluate.py` (writes `results/eval_P4_<team>.md`)
   - `quantize.py`, `export_onnx.py`, `set_team.py`
@@ -27,7 +27,7 @@ Team Tiger FC: Aditya Hubbly 1RUA24CSE0021, Samay Chetan 1RUA24CSE0401, Shaun 1R
 ```bash
 pip install -r requirements.txt            # dev: torch + onnxruntime
 python app.py                              # UI on :7860
-python -m pytest -q tests                  # 15 tests
+python -m pytest -q tests                  # 23 tests
 python -m depthforge.cli compare --scale 4 --condition hard
 python scripts/train.py --data nyu --mat nyu_depth_v2_labeled.mat --minutes 60 --crop 128 --init weights/depthforge_net.pt
 python scripts/train_router.py --data nyu --mat nyu_depth_v2_labeled.mat --n 100   # after retraining; fits on val 900-999, writes weights/router.json + results/router_report.md
